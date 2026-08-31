@@ -1,0 +1,10 @@
+# Virtual Environment
+.venv/
+
+# Python Cache
+__pycache__/
+*.pyc
+
+# Data, Recordings & Outputs
+data/
+outputs/
