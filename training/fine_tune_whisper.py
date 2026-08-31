@@ -16,10 +16,10 @@ from transformers import (
 # ============================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-MANIFEST_DIR = PROJECT_ROOT / "training" / "manifests"
+SEGMENT_DIR = PROJECT_ROOT / "training" / "segments"
 
-TRAIN_FILE = MANIFEST_DIR / "train.csv"
-VALIDATION_FILE = MANIFEST_DIR / "validation.csv"
+TRAIN_FILE = SEGMENT_DIR / "train_segments.csv"
+VALIDATION_FILE = SEGMENT_DIR / "validation_segments.csv"
 
 OUTPUT_DIR = (
     PROJECT_ROOT
@@ -55,7 +55,10 @@ def create_dataset(records):
 
     for row in records:
 
-        audio_path = PROJECT_ROOT / Path(row["audio"].replace("\\", "/"))
+        audio_path = (
+            PROJECT_ROOT
+            / Path(row["audio"].replace("\\", "/"))
+        )
 
         if not audio_path.exists():
             raise FileNotFoundError(
@@ -100,17 +103,19 @@ def prepare_example(example):
     input_features = processor.feature_extractor(
         audio["array"],
         sampling_rate=audio["sampling_rate"],
+        truncation=True,
     ).input_features[0]
 
     labels = processor.tokenizer(
-        example["text"]
+        example["text"],
+        truncation=True,
+        max_length=448,
     ).input_ids
 
     return {
         "input_features": input_features,
         "labels": labels,
     }
-
 
 # ============================================================
 # DATA COLLATOR
