@@ -11,15 +11,23 @@ from transformers import (
 )
 
 
-# ============================================================
-# PATHS
-# ============================================================
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-SEGMENT_DIR = PROJECT_ROOT / "training" / "segments"
 
-TRAIN_FILE = SEGMENT_DIR / "train_segments.csv"
-VALIDATION_FILE = SEGMENT_DIR / "validation_segments.csv"
+SEGMENT_DIR = (
+    PROJECT_ROOT
+    / "training"
+    / "segments"
+)
+
+TRAIN_FILE = (
+    SEGMENT_DIR
+    / "train_segments.csv"
+)
+
+VALIDATION_FILE = (
+    SEGMENT_DIR
+    / "validation_segments.csv"
+)
 
 OUTPUT_DIR = (
     PROJECT_ROOT
@@ -30,22 +38,33 @@ OUTPUT_DIR = (
 
 MODEL_NAME = "openai/whisper-small"
 
+MAX_LABEL_LENGTH = 448
+
 
 # ============================================================
 # CSV
 # ============================================================
 
 def load_csv(path: Path):
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Manifest bulunamadı: {path}"
+        )
+
     with path.open(
         "r",
         encoding="utf-8-sig",
         newline=""
     ) as f:
-        return list(csv.DictReader(f))
+
+        return list(
+            csv.DictReader(f)
+        )
 
 
 # ============================================================
-# DATASET
+# Dataset
 # ============================================================
 
 def create_dataset(records):
@@ -57,16 +76,27 @@ def create_dataset(records):
 
         audio_path = (
             PROJECT_ROOT
-            / Path(row["audio"].replace("\\", "/"))
+            / Path(
+                row["audio"].replace(
+                    "\\",
+                    "/"
+                )
+            )
         )
 
         if not audio_path.exists():
             raise FileNotFoundError(
-                f"Audio bulunamadı: {audio_path}"
+                f"Audio bulunamadı: "
+                f"{audio_path}"
             )
 
-        audio_paths.append(str(audio_path))
-        texts.append(row["text"])
+        audio_paths.append(
+            str(audio_path)
+        )
+
+        texts.append(
+            row["text"].strip()
+        )
 
     dataset = Dataset.from_dict({
         "audio": audio_paths,
@@ -75,14 +105,16 @@ def create_dataset(records):
 
     dataset = dataset.cast_column(
         "audio",
-        Audio(sampling_rate=16000)
+        Audio(
+            sampling_rate=16000
+        )
     )
 
     return dataset
 
 
 # ============================================================
-# PROCESSOR
+# Processor
 # ============================================================
 
 processor = WhisperProcessor.from_pretrained(
@@ -93,71 +125,150 @@ processor = WhisperProcessor.from_pretrained(
 
 
 # ============================================================
-# PREPROCESS
+# Preprocessing
 # ============================================================
 
 def prepare_example(example):
 
     audio = example["audio"]
 
-    input_features = processor.feature_extractor(
-        audio["array"],
-        sampling_rate=audio["sampling_rate"],
-        truncation=True,
-    ).input_features[0]
+    audio_array = audio["array"]
 
-    labels = processor.tokenizer(
+    # Stereo güvenliği
+    if getattr(
+        audio_array,
+        "ndim",
+        1
+    ) == 2:
+
+        # datasets bazı durumlarda
+        # [samples, channels],
+        # bazı durumlarda [channels, samples]
+        # verebilir.
+        #
+        # En büyük ekseni sample olarak kabul ediyoruz.
+
+        if audio_array.shape[0] < audio_array.shape[1]:
+            audio_array = audio_array.mean(
+                axis=0
+            )
+        else:
+            audio_array = audio_array.mean(
+                axis=1
+            )
+
+    input_features = (
+        processor.feature_extractor(
+            audio_array,
+            sampling_rate=audio["sampling_rate"],
+        ).input_features[0]
+    )
+
+    label_ids = processor.tokenizer(
         example["text"],
-        truncation=True,
-        max_length=448,
+        truncation=False,
     ).input_ids
+
+    # --------------------------------------------------------
+    # Whisper 448 token sınırı
+    # --------------------------------------------------------
+
+    if len(label_ids) > MAX_LABEL_LENGTH:
+
+        raise ValueError(
+            "Transcript 448 token sınırını aşıyor.\n"
+            f"Token sayısı: {len(label_ids)}\n"
+            f"Text: {example['text']}"
+        )
 
     return {
         "input_features": input_features,
-        "labels": labels,
+        "labels": label_ids,
     }
 
+
 # ============================================================
-# DATA COLLATOR
+# Data Collator
 # ============================================================
 
 class DataCollatorSpeechSeq2Seq:
 
     def __init__(self, processor):
+
         self.processor = processor
+
+        self.decoder_start_token_id = (
+            processor.tokenizer.bos_token_id
+        )
 
     def __call__(self, features):
 
+        # ----------------------------------------------------
+        # Audio
+        # ----------------------------------------------------
+
         input_features = [
-            feature["input_features"]
-            for feature in features
-        ]
-
-        label_features = [
-            feature["labels"]
-            for feature in features
-        ]
-
-        batch = {
-            "input_features": torch.tensor(
-                input_features,
-                dtype=torch.float32
-            )
-        }
-
-        labels_batch = self.processor.tokenizer.pad(
             {
-                "input_ids": label_features
-            },
-            padding=True,
-            return_tensors="pt",
+                "input_features":
+                feature["input_features"]
+            }
+            for feature in features
+        ]
+
+        batch = (
+            self.processor
+            .feature_extractor
+            .pad(
+                input_features,
+                return_tensors="pt",
+            )
         )
 
-        labels = labels_batch["input_ids"]
+        # ----------------------------------------------------
+        # Labels
+        # ----------------------------------------------------
 
-        labels[
-            labels == self.processor.tokenizer.pad_token_id
-        ] = -100
+        label_features = [
+            {
+                "input_ids":
+                feature["labels"]
+            }
+            for feature in features
+        ]
+
+        labels_batch = (
+            self.processor
+            .tokenizer
+            .pad(
+                label_features,
+                return_tensors="pt",
+            )
+        )
+
+        labels = labels_batch[
+            "input_ids"
+        ]
+
+        labels = labels.masked_fill(
+            labels_batch[
+                "attention_mask"
+            ].ne(1),
+            -100,
+        )
+
+        # ----------------------------------------------------
+        # Whisper BOS token
+        # ----------------------------------------------------
+
+        if (
+            labels.shape[1] > 0
+            and (
+                labels[:, 0]
+                == self.decoder_start_token_id
+            ).all().cpu().item()
+        ):
+
+            labels = labels[:, 1:]
 
         batch["labels"] = labels
 
@@ -165,7 +276,7 @@ class DataCollatorSpeechSeq2Seq:
 
 
 # ============================================================
-# MAIN
+# Main
 # ============================================================
 
 def main():
@@ -174,124 +285,206 @@ def main():
     print("WHISPER FINE-TUNING")
     print("=" * 80)
 
-    print(f"Model       : {MODEL_NAME}")
-    print(f"Train       : {TRAIN_FILE}")
-    print(f"Validation  : {VALIDATION_FILE}")
-    print(f"Output      : {OUTPUT_DIR}")
+    print(
+        f"Model      : {MODEL_NAME}"
+    )
+
+    print(
+        f"Train      : {TRAIN_FILE}"
+    )
+
+    print(
+        f"Validation : {VALIDATION_FILE}"
+    )
+
+    print(
+        f"Output     : {OUTPUT_DIR}"
+    )
 
     # --------------------------------------------------------
-    # Load manifests
+    # Load
     # --------------------------------------------------------
 
-    train_records = load_csv(TRAIN_FILE)
-    validation_records = load_csv(VALIDATION_FILE)
+    train_records = load_csv(
+        TRAIN_FILE
+    )
+
+    validation_records = load_csv(
+        VALIDATION_FILE
+    )
 
     print()
-    print(f"Train kayıtları      : {len(train_records)}")
-    print(f"Validation kayıtları : {len(validation_records)}")
+    print(
+        f"Train segments      : "
+        f"{len(train_records)}"
+    )
+
+    print(
+        f"Validation segments : "
+        f"{len(validation_records)}"
+    )
 
     # --------------------------------------------------------
     # Dataset
     # --------------------------------------------------------
 
     print()
-    print("Dataset oluşturuluyor...")
+    print(
+        "Dataset oluşturuluyor..."
+    )
 
-    train_dataset = create_dataset(train_records)
-    validation_dataset = create_dataset(
-        validation_records
+    train_dataset = create_dataset(
+        train_records
+    )
+
+    validation_dataset = (
+        create_dataset(
+            validation_records
+        )
     )
 
     # --------------------------------------------------------
-    # Preprocessing
+    # Preprocess
     # --------------------------------------------------------
 
-    print("Audio preprocessing...")
+    print(
+        "Audio preprocessing..."
+    )
 
     train_dataset = train_dataset.map(
         prepare_example,
-        remove_columns=["audio", "text"],
+        remove_columns=[
+            "audio",
+            "text",
+        ],
+        desc="Train preprocessing",
     )
 
-    validation_dataset = validation_dataset.map(
-        prepare_example,
-        remove_columns=["audio", "text"],
+    validation_dataset = (
+        validation_dataset.map(
+            prepare_example,
+            remove_columns=[
+                "audio",
+                "text",
+            ],
+            desc="Validation preprocessing",
+        )
     )
 
-    print("Dataset hazır.")
+    print(
+        "Dataset hazır."
+    )
 
     # --------------------------------------------------------
     # Model
     # --------------------------------------------------------
 
     print()
-    print("Whisper modeli yükleniyor...")
-
-    model = WhisperForConditionalGeneration.from_pretrained(
-        MODEL_NAME
+    print(
+        "Whisper modeli yükleniyor..."
     )
 
-    model.generation_config.language = "turkish"
-    model.generation_config.task = "transcribe"
+    model = (
+        WhisperForConditionalGeneration
+        .from_pretrained(
+            MODEL_NAME
+        )
+    )
+
+    model.generation_config.language = (
+        "turkish"
+    )
+
+    model.generation_config.task = (
+        "transcribe"
+    )
+
+    model.generation_config.forced_decoder_ids = (
+        None
+    )
 
     model.config.forced_decoder_ids = None
 
     # --------------------------------------------------------
-    # Training arguments
+    # Training
     # --------------------------------------------------------
 
-    training_args = Seq2SeqTrainingArguments(
+    training_args = (
+        Seq2SeqTrainingArguments(
 
-        output_dir=str(OUTPUT_DIR),
+            output_dir=str(
+                OUTPUT_DIR
+            ),
 
-        per_device_train_batch_size=4,
-        per_device_eval_batch_size=4,
+            per_device_train_batch_size=4,
 
-        gradient_accumulation_steps=1,
+            per_device_eval_batch_size=4,
 
-        learning_rate=1e-5,
+            gradient_accumulation_steps=1,
 
-        num_train_epochs=3,
+            learning_rate=1e-5,
 
-        warmup_steps=50,
+            num_train_epochs=3,
 
-        eval_strategy="epoch",
-        save_strategy="epoch",
+            warmup_steps=20,
 
-        logging_steps=10,
+            eval_strategy="epoch",
 
-        predict_with_generate=True,
+            save_strategy="epoch",
 
-        fp16=torch.cuda.is_available(),
+            logging_strategy="steps",
 
-        save_total_limit=2,
+            logging_steps=10,
 
-        load_best_model_at_end=True,
+            predict_with_generate=True,
 
-        report_to="none",
+            fp16=torch.cuda.is_available(),
 
-        seed=42,
+            save_total_limit=2,
+
+            load_best_model_at_end=True,
+
+            metric_for_best_model="eval_loss",
+
+            greater_is_better=False,
+
+            report_to="none",
+
+            seed=42,
+        )
+    )
+
+    # --------------------------------------------------------
+    # Collator
+    # --------------------------------------------------------
+
+    data_collator = (
+        DataCollatorSpeechSeq2Seq(
+            processor
+        )
     )
 
     # --------------------------------------------------------
     # Trainer
     # --------------------------------------------------------
 
-    data_collator = DataCollatorSpeechSeq2Seq(
-        processor
-    )
-
     trainer = Seq2SeqTrainer(
+
         model=model,
+
         args=training_args,
+
         train_dataset=train_dataset,
+
         eval_dataset=validation_dataset,
+
         data_collator=data_collator,
+
         processing_class=processor,
     )
 
     # --------------------------------------------------------
-    # Training
+    # Train
     # --------------------------------------------------------
 
     print()
@@ -306,7 +499,9 @@ def main():
     # --------------------------------------------------------
 
     print()
-    print("Model kaydediliyor...")
+    print(
+        "Model kaydediliyor..."
+    )
 
     trainer.save_model(
         str(OUTPUT_DIR)
@@ -321,7 +516,9 @@ def main():
     print("TRAINING TAMAMLANDI")
     print("=" * 80)
 
-    print(f"Model: {OUTPUT_DIR}")
+    print(
+        f"Model: {OUTPUT_DIR}"
+    )
 
 
 if __name__ == "__main__":
