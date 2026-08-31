@@ -1,10 +1,15 @@
-# Virtual Environment
+# Python / Sanal Ortam
 .venv/
-
-# Python Cache
 __pycache__/
 *.pyc
 
-# Data, Recordings & Outputs
+# Tüm Veri, Manifest, Segment ve Model Çıktıları
 data/
 outputs/
+training/manifests/
+training/segments/
+training/models/
+
+# IDE / Sistem Dosyaları
+.vscode/
+.DS_Store

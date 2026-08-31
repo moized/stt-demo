@@ -1,191 +1,235 @@
-from pathlib import Path
 import csv
+from pathlib import Path
+import unicodedata
 
+from datasets import Audio, Dataset
+import torch
+from transformers import (
+    Seq2SeqTrainer,
+    Seq2SeqTrainingArguments,
+    WhisperForConditionalGeneration,
+    WhisperProcessor,
+)
 
+# ----------------------------------------------------------------------
+# Yol ve Model Yapılandırması
+# ----------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+SEGMENT_DIR = PROJECT_ROOT / "training" / "segments"
 
-MANIFEST_DIR = PROJECT_ROOT / "training" / "manifests"
+TRAIN_FILE = SEGMENT_DIR / "train_segments.csv"
+VALIDATION_FILE = SEGMENT_DIR / "validation_segments.csv"
+OUTPUT_DIR = (
+    PROJECT_ROOT / "training" / "models" / "whisper-small-finetuned"
+)
 
-TRAIN_FILE = MANIFEST_DIR / "train.csv"
-VALIDATION_FILE = MANIFEST_DIR / "validation.csv"
-
-BASE_MODEL = "openai/whisper-small"
-
-OUTPUT_DIR = PROJECT_ROOT / "training" / "output"
-
-
-def read_manifest(path: Path):
-
-    with path.open(
-        "r",
-        encoding="utf-8-sig",
-        newline=""
-    ) as f:
-
-        return list(csv.DictReader(f))
+MODEL_NAME = "openai/whisper-small"
+MAX_LABEL_LENGTH = 448
 
 
-def check_manifest(path: Path):
-
+# ----------------------------------------------------------------------
+# Veri Yükleme ve Doğrulama
+# ----------------------------------------------------------------------
+def load_and_validate_manifest(path: Path) -> list[dict]:
     if not path.exists():
-        raise FileNotFoundError(
-            f"Manifest bulunamadı: {path}"
-        )
+        raise FileNotFoundError(f"Segment manifest bulunamadı: {path}")
 
-    records = read_manifest(path)
-
-    required_columns = {
-        "id",
-        "category",
-        "transcript_type",
-        "audio",
-        "transcript",
-        "text",
-    }
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        records = list(csv.DictReader(f))
 
     if not records:
+        raise ValueError(f"Manifest dosyası boş: {path}")
+
+    validated = []
+    missing_audio_count = 0
+
+    for row in records:
+        text = unicodedata.normalize("NFC", row.get("text", "").strip())
+        if not text:
+            continue
+
+        audio_rel_path = row["audio"].replace("\\", "/")
+        audio_path = PROJECT_ROOT / Path(audio_rel_path)
+
+        if not audio_path.exists():
+            missing_audio_count += 1
+            continue
+
+        validated.append({"audio": str(audio_path), "text": text})
+
+    if missing_audio_count > 0:
+        print(f"[UYARI] {path.name}: {missing_audio_count} ses dosyası bulunamadı!")
+
+    return validated
+
+
+def create_hf_dataset(records: list[dict]) -> Dataset:
+    audio_paths = [r["audio"] for r in records]
+    texts = [r["text"] for r in records]
+
+    ds = Dataset.from_dict({"audio": audio_paths, "text": texts})
+    return ds.cast_column("audio", Audio(sampling_rate=16000))
+
+
+# ----------------------------------------------------------------------
+# Preprocessing & Data Collator
+# ----------------------------------------------------------------------
+processor = WhisperProcessor.from_pretrained(
+    MODEL_NAME, language="turkish", task="transcribe"
+)
+
+
+def prepare_example(example: dict) -> dict:
+    audio = example["audio"]
+    audio_array = audio["array"]
+
+    # Stereo sesleri mono kanala indirgeme
+    if getattr(audio_array, "ndim", 1) == 2:
+        if audio_array.shape[0] < audio_array.shape[1]:
+            audio_array = audio_array.mean(axis=0)
+        else:
+            audio_array = audio_array.mean(axis=1)
+
+    input_features = processor.feature_extractor(
+        audio_array, sampling_rate=audio["sampling_rate"]
+    ).input_features[0]
+
+    label_ids = processor.tokenizer(
+        example["text"], truncation=False
+    ).input_ids
+
+    if len(label_ids) > MAX_LABEL_LENGTH:
         raise ValueError(
-            f"Manifest boş: {path}"
+            f"Metin Whisper {MAX_LABEL_LENGTH} token sınırını aşıyor ({len(label_ids)} token):\n{example['text']}"
         )
 
-    missing = required_columns - set(records[0].keys())
+    return {"input_features": input_features, "labels": label_ids}
 
-    if missing:
-        raise ValueError(
-            f"Eksik kolonlar: {missing}"
+
+class DataCollatorSpeechSeq2Seq:
+
+    def __init__(self, proc):
+        self.processor = proc
+        self.decoder_start_token_id = proc.tokenizer.bos_token_id
+
+    def __call__(self, features: list[dict]) -> dict:
+        input_features = [
+            {"input_features": f["input_features"]} for f in features
+        ]
+        batch = self.processor.feature_extractor.pad(
+            input_features, return_tensors="pt"
         )
 
-    return records
+        label_features = [{"input_ids": f["labels"]} for f in features]
+        labels_batch = self.processor.tokenizer.pad(
+            label_features, return_tensors="pt"
+        )
+
+        labels = labels_batch["input_ids"]
+        labels = labels.masked_fill(
+            labels_batch["attention_mask"].ne(1), -100
+        )
+
+        if (
+            labels.shape[1] > 0
+            and (labels[:, 0] == self.decoder_start_token_id).all().cpu().item()
+        ):
+            labels = labels[:, 1:]
+
+        batch["labels"] = labels
+        return batch
 
 
+# ----------------------------------------------------------------------
+# Main Training Loop
+# ----------------------------------------------------------------------
 def main():
-
     print("=" * 80)
-    print("WHISPER FINE-TUNING DATA CHECK")
+    print("WHISPER FINE-TUNING")
     print("=" * 80)
+    print(f"Base Model : {MODEL_NAME}")
+    print(f"Çıktı Yolu : {OUTPUT_DIR}\n")
 
-    print()
-    print(f"Base model : {BASE_MODEL}")
-    print()
+    # 1. Veri Yükleme ve Doğrulama
+    train_records = load_and_validate_manifest(TRAIN_FILE)
+    val_records = load_and_validate_manifest(VALIDATION_FILE)
 
-    # ------------------------------------------------------------
-    # Train
-    # ------------------------------------------------------------
+    print(f"Geçerli Train Segment Sayısı      : {len(train_records)}")
+    print(f"Geçerli Validation Segment Sayısı : {len(val_records)}")
 
-    train_records = check_manifest(TRAIN_FILE)
+    if not train_records or not val_records:
+        raise ValueError("Eğitim için yeterli segment verisi bulunamadı!")
 
-    print(f"Train kayıtları      : {len(train_records)}")
+    # 2. Dataset Dönüşümü
+    print("\nDataset hazırlanıyor...")
+    train_ds = create_hf_dataset(train_records)
+    val_ds = create_hf_dataset(val_records)
 
-    # ------------------------------------------------------------
-    # Validation
-    # ------------------------------------------------------------
-
-    validation_records = check_manifest(
-        VALIDATION_FILE
+    train_ds = train_ds.map(
+        prepare_example,
+        remove_columns=["audio", "text"],
+        desc="Train ön işleme",
+    )
+    val_ds = val_ds.map(
+        prepare_example,
+        remove_columns=["audio", "text"],
+        desc="Validation ön işleme",
     )
 
-    print(
-        f"Validation kayıtları : "
-        f"{len(validation_records)}"
+    # 3. Model Yükleme
+    print("\nWhisper modeli yükleniyor...")
+    model = WhisperForConditionalGeneration.from_pretrained(MODEL_NAME)
+    model.generation_config.language = "turkish"
+    model.generation_config.task = "transcribe"
+    model.generation_config.forced_decoder_ids = None
+    model.config.forced_decoder_ids = None
+
+    # 4. Eğitim Bağımsız Değişkenleri
+    training_args = Seq2SeqTrainingArguments(
+        output_dir=str(OUTPUT_DIR),
+        per_device_train_batch_size=4,
+        per_device_eval_batch_size=4,
+        gradient_accumulation_steps=1,
+        learning_rate=1e-5,
+        num_train_epochs=3,
+        warmup_steps=20,
+        eval_strategy="epoch",
+        save_strategy="epoch",
+        logging_strategy="steps",
+        logging_steps=10,
+        predict_with_generate=True,
+        fp16=torch.cuda.is_available(),
+        save_total_limit=2,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        report_to="none",
+        seed=42,
     )
 
-    # ------------------------------------------------------------
-    # Text kontrolü
-    # ------------------------------------------------------------
-
-    empty_train = [
-        r for r in train_records
-        if not r["text"].strip()
-    ]
-
-    empty_validation = [
-        r for r in validation_records
-        if not r["text"].strip()
-    ]
-
-    print()
-    print(f"Boş train transcript      : {len(empty_train)}")
-    print(
-        f"Boş validation transcript : "
-        f"{len(empty_validation)}"
+    trainer = Seq2SeqTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_ds,
+        eval_dataset=val_ds,
+        data_collator=DataCollatorSpeechSeq2Seq(processor),
+        processing_class=processor,
     )
 
-    # ------------------------------------------------------------
-    # Audio path kontrolü
-    # ------------------------------------------------------------
-
-    missing_train_audio = []
-
-    for record in train_records:
-
-        audio_path = PROJECT_ROOT / record["audio"]
-
-        if not audio_path.exists():
-            missing_train_audio.append(
-                str(audio_path)
-            )
-
-    missing_validation_audio = []
-
-    for record in validation_records:
-
-        audio_path = PROJECT_ROOT / record["audio"]
-
-        if not audio_path.exists():
-            missing_validation_audio.append(
-                str(audio_path)
-            )
-
-    print()
-    print(
-        f"Bulunamayan train audio      : "
-        f"{len(missing_train_audio)}"
-    )
-
-    print(
-        f"Bulunamayan validation audio : "
-        f"{len(missing_validation_audio)}"
-    )
-
-    # ------------------------------------------------------------
-    # İlk örnek
-    # ------------------------------------------------------------
-
-    print()
-    print("-" * 80)
-    print("İLK TRAIN ÖRNEĞİ")
-    print("-" * 80)
-
-    first = train_records[0]
-
-    print(f"ID         : {first['id']}")
-    print(f"Category   : {first['category']}")
-    print(f"Audio      : {first['audio']}")
-    print(f"Transcript : {first['transcript']}")
-    print(f"Text       : {first['text'][:300]}")
-
-    # ------------------------------------------------------------
-    # Sonuç
-    # ------------------------------------------------------------
-
-    print()
+    # 5. Eğitimi Başlatma
+    print("\n" + "=" * 80)
+    print("EĞİTİM BAŞLIYOR")
     print("=" * 80)
+    trainer.train()
 
-    if (
-        empty_train
-        or empty_validation
-        or missing_train_audio
-        or missing_validation_audio
-    ):
+    # 6. Kaydetme
+    print("\nModel ve Processor kaydediliyor...")
+    trainer.save_model(str(OUTPUT_DIR))
+    processor.save_pretrained(str(OUTPUT_DIR))
 
-        print("DATA CHECK: BAŞARISIZ")
-        print("Yukarıdaki sorunları düzelt.")
-
-    else:
-
-        print("DATA CHECK: BAŞARILI")
-        print("Whisper training için manifest yapısı hazır.")
-
+    print("\n" + "=" * 80)
+    print("EĞİTİM BAŞARIYLA TAMAMLANDI")
+    print(f"Model Kayıt Yeri: {OUTPUT_DIR}")
     print("=" * 80)
 
 
