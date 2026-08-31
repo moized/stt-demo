@@ -15,34 +15,35 @@ def read_text(path: Path) -> str:
 
 def clean_transcript(text: str) -> str:
     """
-    Transcript içindeki metadata/talimat satırlarını temizler.
+    Transcript metadata'sını ve zaman/konuşmacı etiketlerini temizler.
 
-    Örneğin:
+    Örnek:
 
-    # taslak: gemini...
-    # duzelt: ...
+    [00:03] Konuşmacı 2: Alo.
+    [00:07] Konuşmacı 1: Merhaba, nasılsınız?
+    [00:12] [sessizlik]
 
-    veya:
+    sonuç:
 
-    Model: gemini...
-    Prompt-SHA256: ...
-    --- TRANSKRIPT ---
-
-    gibi satırları kaldırır.
+    Alo.
+    Merhaba, nasılsınız?
     """
 
-    lines = text.splitlines()
+    import re
 
+    lines = text.splitlines()
     cleaned = []
 
     for line in lines:
         stripped = line.strip()
 
-        # Boş satır
         if not stripped:
             continue
 
-        # Gemini metadata
+        # ---------------------------------------------------------
+        # Metadata / instructions
+        # ---------------------------------------------------------
+
         if stripped.startswith("# taslak:"):
             continue
 
@@ -58,10 +59,58 @@ def clean_transcript(text: str) -> str:
         if stripped == "--- TRANSKRIPT ---":
             continue
 
-        cleaned.append(stripped)
+        # ---------------------------------------------------------
+        # Timestamp
+        # [00:03]
+        # ---------------------------------------------------------
+
+        stripped = re.sub(
+            r"^\[\d{2}:\d{2}(?::\d{2})?\]\s*",
+            "",
+            stripped,
+        )
+
+        # ---------------------------------------------------------
+        # Speaker label
+        # Konuşmacı 1:
+        # Konuşmacı 2:
+        # ---------------------------------------------------------
+
+        stripped = re.sub(
+            r"^Konuşmacı\s+\d+\s*:\s*",
+            "",
+            stripped,
+            flags=re.IGNORECASE,
+        )
+
+        # ---------------------------------------------------------
+        # Non-speech annotations
+        # ---------------------------------------------------------
+
+        if stripped.lower() in {
+            "[sessizlik]",
+            "[anlaşılmıyor]",
+        }:
+            continue
+
+        # Satır içinde [anlaşılmıyor] varsa da kaldır.
+        stripped = re.sub(
+            r"\[anlaşılmıyor\]",
+            "",
+            stripped,
+            flags=re.IGNORECASE,
+        )
+
+        # ---------------------------------------------------------
+        # Son temizleme
+        # ---------------------------------------------------------
+
+        stripped = stripped.strip()
+
+        if stripped:
+            cleaned.append(stripped)
 
     return "\n".join(cleaned)
-
 
 def find_audio(folder: Path):
     wav_files = list(folder.glob("*.wav"))
