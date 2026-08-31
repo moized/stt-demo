@@ -55,7 +55,7 @@ def create_dataset(records):
 
     for row in records:
 
-        audio_path = PROJECT_ROOT / row["audio"]
+        audio_path = = PROJECT_ROOT / Path(row["audio"].replace("\\", "/"))
 
         if not audio_path.exists():
             raise FileNotFoundError(
