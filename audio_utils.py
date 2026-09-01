@@ -1,63 +1,39 @@
 from pathlib import Path
+from typing import Union
 
 import numpy as np
 import soundfile as sf
 
 
-def load_stereo_audio(audio_path: str):
-    """
-    Load a WAV file and return:
-        sample_rate
-        left_channel
-        right_channel
-
-    Our project convention:
-        LEFT  = Agent
-        RIGHT = Customer
-    """
-
+def load_stereo_audio(audio_path: Union[str, Path]):
+    """WAV dosyasını yükler ve Sol (Agent) / Sağ (Customer) kanallarını döner."""
+    audio_path = str(audio_path)
     audio, sample_rate = sf.read(audio_path, always_2d=True)
 
     if audio.shape[1] < 2:
         raise ValueError(
-            "This project expects stereo audio with two channels."
+            "Bu proje stereo (2 kanallı) ses kayıtları beklemektedir."
         )
 
-    left = audio[:, 0]
-    right = audio[:, 1]
-
-    return sample_rate, left, right
+    return sample_rate, audio[:, 0], audio[:, 1]
 
 
-def save_channel(audio: np.ndarray, sample_rate: int, output_path: str):
-    """
-    Save one channel as a mono WAV file.
-    """
-
-    Path(output_path).parent.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    sf.write(
-        output_path,
-        audio,
-        sample_rate
-    )
+def save_channel(
+    audio: np.ndarray, sample_rate: int, output_path: Union[str, Path]
+):
+    """Tek bir ses kanalını mono WAV olarak kaydeder."""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(str(output_path), audio, sample_rate)
 
 
-def get_audio_info(audio_path: str):
-    """
-    Return basic information about the recording.
-    """
-
+def get_audio_info(audio_path: Union[str, Path]) -> dict:
+    """Ses kaydı hakkında süre ve kanal bilgilerini döner."""
+    audio_path = str(audio_path)
     info = sf.info(audio_path)
-
-    duration = info.frames / info.samplerate
-
     return {
         "sample_rate": info.samplerate,
         "channels": info.channels,
         "frames": info.frames,
-        "duration": duration,
+        "duration": info.frames / info.samplerate,
     }

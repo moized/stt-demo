@@ -1,417 +1,210 @@
-import os
-import time
 from pathlib import Path
+import time
 
-import gradio as gr
-
-from audio_utils import (
-    get_audio_info,
-    load_stereo_audio,
-    save_channel,
-)
-
-from stt_engine import STTEngine
-
+from audio_utils import get_audio_info, load_stereo_audio, save_channel
 from benchmark import evaluate
-
-
-OUTPUT_DIR = Path("outputs")
-TEMP_DIR = OUTPUT_DIR / "channels"
-
-OUTPUT_DIR.mkdir(exist_ok=True)
-TEMP_DIR.mkdir(exist_ok=True)
-
-
-# ---------------------------------------------------------
-# Load model once when application starts
-# ---------------------------------------------------------
+from config import (
+    DEFAULT_MODEL_CHOICE,
+    MODEL_OPTIONS,
+    OUTPUT_DIR,
+    TEMP_DIR,
+)
+from export_utils import export_to_csv, export_to_json
+import gradio as gr
+from stt_engine import STTEngine
 
 ENGINE = None
 CURRENT_MODEL = None
 
 
-def get_engine(model_size):
+def get_engine(model_key: str):
+    global ENGINE, CURRENT_MODEL
 
-    global ENGINE
-    global CURRENT_MODEL
+    model_path_or_name = MODEL_OPTIONS.get(model_key, model_key)
 
-    if ENGINE is None or CURRENT_MODEL != model_size:
-
-        ENGINE = STTEngine(
-            model_size=model_size,
-            device="cpu",
-            compute_type="int8"
-        )
-
-        CURRENT_MODEL = model_size
+    if ENGINE is None or CURRENT_MODEL != model_key:
+        ENGINE = STTEngine(model_size_or_path=model_path_or_name)
+        CURRENT_MODEL = model_key
 
     return ENGINE
 
 
-# ---------------------------------------------------------
-# Formatting
-# ---------------------------------------------------------
-
-def format_timestamp(seconds):
-
+def format_timestamp(seconds: float) -> str:
     total_seconds = int(seconds)
-
     minutes = total_seconds // 60
-    seconds = total_seconds % 60
+    secs = total_seconds % 60
+    return f"{minutes:02d}:{secs:02d}"
 
-    return f"{minutes:02d}:{seconds:02d}"
 
-
-def format_transcript(results):
-
+def format_transcript(results: list[dict]) -> str:
     lines = []
-
     for item in results:
-
-        timestamp = format_timestamp(
-            item["start"]
-        )
-
-        speaker_number = (
-            "1"
-            if item["speaker"] == "Agent"
-            else "2"
-        )
-
+        timestamp = format_timestamp(item["start"])
+        speaker_number = "1" if item["speaker"] == "Agent" else "2"
         lines.append(
-            f"[{timestamp}] "
-            f"Konuşmacı {speaker_number}: "
-            f"{item['text']}"
+            f"[{timestamp}] Konuşmacı {speaker_number}: {item['text']}"
         )
-
     return "\n".join(lines)
 
 
-def merge_results(agent_results, customer_results):
-
-    combined = (
-        agent_results +
-        customer_results
-    )
-
-    combined.sort(
-        key=lambda x: x["start"]
-    )
-
+def merge_results(
+    agent_results: list[dict], customer_results: list[dict]
+) -> list[dict]:
+    combined = agent_results + customer_results
+    combined.sort(key=lambda x: x["start"])
     return combined
 
 
-# ---------------------------------------------------------
-# Main transcription function
-# ---------------------------------------------------------
-
-def transcribe_call(audio_file, model_size):
-
+def transcribe_call(audio_file: str, model_choice: str):
     if audio_file is None:
-
-        return (
-            "Please upload an audio file.",
-            "",
-            "",
-            None
-        )
+        return "Lütfen bir ses dosyası yükleyin.", "", "", None, None
 
     start_total = time.perf_counter()
 
-    audio_path = audio_file
-
-    info = get_audio_info(
-        audio_path
-    )
-
+    info = get_audio_info(audio_file)
     if info["channels"] < 2:
-
         return (
-            "ERROR: The recording must be stereo.",
+            "HATA: Ses kaydı stereo (2 kanal) olmalıdır.",
             "",
             "",
-            None
+            None,
+            None,
         )
 
-    sample_rate, left, right = (
-        load_stereo_audio(
-            audio_path
-        )
+    sample_rate, left, right = load_stereo_audio(audio_file)
+
+    agent_path = TEMP_DIR / "agent.wav"
+    customer_path = TEMP_DIR / "customer.wav"
+
+    save_channel(left, sample_rate, agent_path)
+    save_channel(right, sample_rate, customer_path)
+
+    engine = get_engine(model_choice)
+
+    agent_results, _, agent_time = engine.transcribe(
+        str(agent_path), speaker="Agent"
+    )
+    customer_results, _, customer_time = engine.transcribe(
+        str(customer_path), speaker="Customer"
     )
 
-    # -------------------------------------------------
-    # Save channels
-    # -------------------------------------------------
+    results = merge_results(agent_results, customer_results)
+    transcript = format_transcript(results)
 
-    agent_path = (
-        TEMP_DIR / "agent.wav"
-    )
-
-    customer_path = (
-        TEMP_DIR / "customer.wav"
-    )
-
-    save_channel(
-        left,
-        sample_rate,
-        agent_path
-    )
-
-    save_channel(
-        right,
-        sample_rate,
-        customer_path
-    )
-
-    # -------------------------------------------------
-    # Load model
-    # -------------------------------------------------
-
-    engine = get_engine(
-        model_size
-    )
-
-    # -------------------------------------------------
-    # Agent transcription
-    # -------------------------------------------------
-
-    agent_results, _, agent_time = (
-        engine.transcribe(
-            str(agent_path),
-            speaker="Agent"
-        )
-    )
-
-    # -------------------------------------------------
-    # Customer transcription
-    # -------------------------------------------------
-
-    customer_results, _, customer_time = (
-        engine.transcribe(
-            str(customer_path),
-            speaker="Customer"
-        )
-    )
-
-    # -------------------------------------------------
-    # Merge
-    # -------------------------------------------------
-
-    results = merge_results(
-        agent_results,
-        customer_results
-    )
-
-    transcript = format_transcript(
-        results
-    )
-
-    total_time = (
-        time.perf_counter()
-        - start_total
-    )
-
+    total_time = time.perf_counter() - start_total
     duration = info["duration"]
-
-    if duration > 0:
-
-        realtime_factor = (
-            total_time / duration
-        )
-
-    else:
-
-        realtime_factor = 0
+    realtime_factor = (total_time / duration) if duration > 0 else 0
 
     statistics = f"""
-### Recording
+### Ses Kaydı Bilgileri
+- **Süre:** {duration:.1f} saniye
+- **Örnekleme Hızı:** {sample_rate} Hz
+- **Kanal Sayısı:** {info['channels']} (Stereo)
 
-**Duration:** {duration:.1f} seconds
-
-**Sample rate:** {sample_rate} Hz
-
-**Channels:** {info["channels"]}
-
-### Processing
-
-**Model:** Whisper / faster-whisper `{model_size}`
-
-**Agent processing:** {agent_time:.2f} sec
-
-**Customer processing:** {customer_time:.2f} sec
-
-**Total processing:** {total_time:.2f} sec
-
-**Real-time factor:** {realtime_factor:.2f}×
-
-### Speakers
-
-🧑 Agent = LEFT channel
-
-👤 Customer = RIGHT channel
+### Performans ve İşlem
+- **Kullanılan Model:** `{model_choice}`
+- **Müşteri Temsilcisi (Sol):** {agent_time:.2f} sn
+- **Müşteri (Sağ):** {customer_time:.2f} sn
+- **Toplam İşlem Süresi:** {total_time:.2f} sn
+- **Gerçek Zaman Katsayısı (RTF):** {realtime_factor:.2f}×
 """
 
-    # -------------------------------------------------
-    # Save transcript
-    # -------------------------------------------------
+    txt_path = OUTPUT_DIR / "latest_transcript.txt"
+    txt_path.write_text(transcript, encoding="utf-8")
 
-    output_file = (
-        OUTPUT_DIR / "latest_transcript.txt"
-    )
-
-    output_file.write_text(
-        transcript,
-        encoding="utf-8"
-    )
+    json_path = export_to_json(results, "latest_transcript.json")
 
     return (
         transcript,
         statistics,
-        "Transcription completed.",
-        str(output_file)
+        "Transkripsiyon tamamlandı.",
+        str(txt_path),
+        str(json_path),
     )
 
-# ---------------------------------------------------------
-# Benchmark comparison
-# ---------------------------------------------------------
 
-def compare_transcript(reference_text, hypothesis_text):
-
+def compare_transcript(reference_text: str, hypothesis_text: str):
     if not reference_text.strip():
-        return "Please enter the manual/reference transcript."
+        return "Lütfen manuel referans metni girin."
 
     if not hypothesis_text.strip():
-        return "Please run the STT transcription first."
+        return "Lütfen önce transkripsiyonu çalıştırın."
 
-    results = evaluate(
-        reference=reference_text,
-        hypothesis=hypothesis_text
-    )
+    results = evaluate(reference=reference_text, hypothesis=hypothesis_text)
 
     return f"""
-## 📊 Benchmark Result
+## 📊 Karşılaştırma Sonucu (Benchmark)
 
-| Metric | Result |
+| Metrik | Değer |
 |---|---:|
-| **WER** | {results["WER"]:.2%} |
-| **CER** | {results["CER"]:.2%} |
+| **WER (Kelime Hata Oranı)** | **%{results['WER'] * 100:.2f}** |
+| **CER (Karakter Hata Oranı)** | **%{results['CER'] * 100:.2f}** |
 
-### What this means
-
-**WER (Word Error Rate)** measures how many word-level
-errors the STT model made compared with the reference.
-
-**CER (Character Error Rate)** measures character-level
-differences between the reference and the model output.
-
-Lower is better.
+*Türkçe ASR Unicode NFC normalizasyonu uygulanmıştır.*
 """
 
-# ---------------------------------------------------------
-# UI
-# ---------------------------------------------------------
 
-with gr.Blocks(
-    title="Turkish STT Demo"
-) as demo:
-
+with gr.Blocks(title="Türkçe Çağrı ASR Demo") as demo:
     gr.Markdown(
         """
-# 🇹🇷 Turkish Call STT Demo
-
-### Veribase-style stereo call transcription
-
-This demo:
-
-1. Reads the stereo call
-2. Separates LEFT and RIGHT channels
-3. Sends each channel to Whisper
-4. Assigns Agent / Customer labels
-5. Merges the results by timestamp
-6. Shows the final transcript
-"""
+    # 🇹🇷 Türkçe Çağrı Merkezi STT Arayüzü
+    Stereo ses kayıtlarını Sol (Agent) ve Sağ (Customer) kanallarına ayırarak zaman damgalı transkripsiyon üretir.
+    """
     )
 
     with gr.Row():
-
-        audio_input = gr.Audio(
-            label="Call recording",
-            type="filepath"
-        )
-
+        audio_input = gr.Audio(label="Çağrı Kaydı (.wav)", type="filepath")
         model_input = gr.Dropdown(
-            choices=[
-                "tiny",
-                "base",
-                "small",
-                "medium"
-            ],
-            value="small",
-            label="Whisper model"
+            choices=list(MODEL_OPTIONS.keys()),
+            value=DEFAULT_MODEL_CHOICE,
+            label="Whisper Modeli Seçin",
         )
 
-    transcribe_button = gr.Button(
-        "🎙️ TRANSCRIBE",
-        variant="primary"
-    )
-    reference_input = gr.Textbox(
-    label="Manual Reference Transcript",
-    placeholder="Paste your manually corrected transcript here...",
-    lines=15
-    )
+    transcribe_button = gr.Button("🎙️ TRANSKRİPSİYONU BAŞLAT", variant="primary")
 
     with gr.Row():
-
         transcript_output = gr.Textbox(
-            label="Transcript",
-            lines=25,
+            label="Model Çıktısı (Transkript)", lines=18
         )
-
-        stats_output = gr.Markdown(
-            label="Statistics"
-        )
+        stats_output = gr.Markdown(label="Performans Metrikleri")
 
     status_output = gr.Markdown()
 
-    compare_button = gr.Button(
-    "📊 COMPARE WITH REFERENCE",
-    variant="secondary"
-)
+    with gr.Row():
+        download_txt = gr.File(label="TXT İndir")
+        download_json = gr.File(label="JSON İndir")
 
-    benchmark_output = gr.Markdown()
+    gr.Markdown("---")
+    gr.Markdown("### 📊 Doğrulama & Benchmark")
 
-    download_output = gr.File(
-        label="Download transcript"
+    reference_input = gr.Textbox(
+        label="Manuel Referans Transkript (Ground Truth)",
+        placeholder="Doğrulanmış metni buraya yapıştırın...",
+        lines=8,
     )
+
+    compare_button = gr.Button(
+        "📊 REFERANS İLE KARŞILAŞTIR (WER/CER)", variant="secondary"
+    )
+    benchmark_output = gr.Markdown()
 
     transcribe_button.click(
         fn=transcribe_call,
-        inputs=[
-            audio_input,
-            model_input
-        ],
+        inputs=[audio_input, model_input],
         outputs=[
             transcript_output,
             stats_output,
             status_output,
-            download_output
-        ]
+            download_txt,
+            download_json,
+        ],
     )
 
     compare_button.click(
-    fn=compare_transcript,
-    inputs=[
-        reference_input,
-        transcript_output
-    ],
-    outputs=[
-        benchmark_output
-    ]
-)
-
+        fn=compare_transcript,
+        inputs=[reference_input, transcript_output],
+        outputs=[benchmark_output],
+    )
 
 if __name__ == "__main__":
-
-    demo.launch(
-        inbrowser=True
-    )
+    demo.launch(inbrowser=True)

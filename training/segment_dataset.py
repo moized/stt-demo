@@ -6,6 +6,7 @@ import unicodedata
 
 import soundfile as sf
 
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 MANIFEST_DIR = PROJECT_ROOT / "training" / "manifests"
@@ -26,42 +27,72 @@ TIMESTAMP_PATTERN = re.compile(
 )
 
 
+# ============================================================
+# TIMESTAMP
+# ============================================================
+
 def parse_timestamp(match):
     first = int(match.group(1))
     second = int(match.group(2))
 
     if match.group(3) is not None:
-        # HH:MM:SS
         hours = first
         minutes = second
         seconds = int(match.group(3))
-        return hours * 3600 + minutes * 60 + seconds
 
-    # MM:SS
+        return (
+            hours * 3600
+            + minutes * 60
+            + seconds
+        )
+
     return first * 60 + second
 
 
-def parse_transcript(text):
-    """Transcript'i utterance seviyesinde parse eder ve Unicode NFC ile normalize eder.
+# ============================================================
+# TRANSCRIPT PARSING
+# ============================================================
 
-    Metadata satırlarını (# taslak, Model:, vb.) filtreler.
-    Çıktı: [(start_seconds, text), ...]
+def parse_transcript(text):
     """
+    Transcript'i utterance / silence event olarak parse eder.
+
+    Çıktı:
+        [
+            {
+                "timestamp": 3.0,
+                "type": "speech",
+                "text": "Alo."
+            },
+            {
+                "timestamp": 5.0,
+                "type": "silence",
+                "text": ""
+            }
+        ]
+    """
+
     if not text:
         return []
 
-    # Unicode NFC Standardizasyonu
-    text = unicodedata.normalize("NFC", text)
+    text = unicodedata.normalize(
+        "NFC",
+        text
+    )
 
     entries = []
 
     for line in text.splitlines():
+
         line = line.strip()
 
         if not line:
             continue
 
-        # Metadata filtreleri
+        # ----------------------------------------------------
+        # Metadata
+        # ----------------------------------------------------
+
         if line.startswith("# taslak:"):
             continue
 
@@ -77,15 +108,23 @@ def parse_transcript(text):
         if line == "--- TRANSKRIPT ---":
             continue
 
+        # ----------------------------------------------------
+        # Timestamp
+        # ----------------------------------------------------
+
         match = TIMESTAMP_PATTERN.match(line)
 
         if not match:
             continue
 
         timestamp = parse_timestamp(match)
+
         content = match.group(4).strip()
 
-        # Konuşmacı etiketi temizliği (Konuşmacı 1:)
+        # ----------------------------------------------------
+        # Speaker
+        # ----------------------------------------------------
+
         content = re.sub(
             r"^Konuşmacı\s+\d+\s*:\s*",
             "",
@@ -93,12 +132,37 @@ def parse_transcript(text):
             flags=re.IGNORECASE,
         ).strip()
 
-        # Sessizlik / anlaşılmıyor temizliği
-        if content.lower() in {
-            "[sessizlik]",
-            "[anlaşılmıyor]",
-        }:
+        # ----------------------------------------------------
+        # Silence
+        # ----------------------------------------------------
+
+        if content.lower() == "[sessizlik]":
+
+            entries.append({
+                "timestamp": timestamp,
+                "type": "silence",
+                "text": "",
+            })
+
             continue
+
+        # ----------------------------------------------------
+        # Unclear
+        # ----------------------------------------------------
+
+        if content.lower() == "[anlaşılmıyor]":
+
+            entries.append({
+                "timestamp": timestamp,
+                "type": "unclear",
+                "text": "",
+            })
+
+            continue
+
+        # ----------------------------------------------------
+        # Inline unclear marker
+        # ----------------------------------------------------
 
         content = re.sub(
             r"\[anlaşılmıyor\]",
@@ -107,125 +171,402 @@ def parse_transcript(text):
             flags=re.IGNORECASE,
         ).strip()
 
-        if content:
-            content = unicodedata.normalize("NFC", content)
-            entries.append((timestamp, content))
+        if not content:
+            continue
+
+        content = unicodedata.normalize(
+            "NFC",
+            content
+        )
+
+        entries.append({
+            "timestamp": timestamp,
+            "type": "speech",
+            "text": content,
+        })
 
     return entries
 
 
+# ============================================================
+# CSV
+# ============================================================
+
 def load_csv(path):
-    with path.open("r", encoding="utf-8-sig", newline="") as f:
-        return list(csv.DictReader(f))
+
+    with path.open(
+        "r",
+        encoding="utf-8-sig",
+        newline=""
+    ) as f:
+
+        return list(
+            csv.DictReader(f)
+        )
 
 
-def write_segment_audio(
+# ============================================================
+# AUDIO
+# ============================================================
+
+def load_audio(path):
+
+    audio, sample_rate = sf.read(path)
+
+    # Stereo -> mono
+    if getattr(audio, "ndim", 1) == 2:
+        audio = audio.mean(axis=1)
+
+    return audio, sample_rate
+
+
+def write_audio_segment(
     audio,
     sample_rate,
     start_sec,
     end_sec,
     output_path,
 ):
-    """Audio'yu [start_sec, end_sec] aralığında çıkarır.
 
-    Stereo ise iki kanalı mono'ya çevirir.
-    """
-    start_sec = max(0.0, start_sec)
-    end_sec = min(end_sec, len(audio) / sample_rate)
+    total_duration = (
+        len(audio) / sample_rate
+    )
+
+    start_sec = max(
+        0.0,
+        start_sec
+    )
+
+    end_sec = min(
+        total_duration,
+        end_sec
+    )
 
     if end_sec <= start_sec:
         return False
 
-    start_sample = int(start_sec * sample_rate)
-    end_sample = int(end_sec * sample_rate)
+    start_sample = int(
+        start_sec * sample_rate
+    )
 
-    segment = audio[start_sample:end_sample]
+    end_sample = int(
+        end_sec * sample_rate
+    )
+
+    segment = audio[
+        start_sample:end_sample
+    ]
 
     if len(segment) == 0:
         return False
 
-    # Stereo -> mono
-    if segment.ndim == 2:
-        segment = segment.mean(axis=1)
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    sf.write(output_path, segment, sample_rate)
+    sf.write(
+        output_path,
+        segment,
+        sample_rate
+    )
 
     return True
 
 
-def process_record(row, split):
-    audio_path = PROJECT_ROOT / Path(row["audio"].replace("\\", "/"))
-    transcript_path = PROJECT_ROOT / Path(row["transcript"].replace("\\", "/"))
+# ============================================================
+# RECORD PROCESSING
+# ============================================================
+
+def process_record(
+    row,
+    split,
+    long_utterances_report,
+):
+
+    audio_path = (
+        PROJECT_ROOT
+        / Path(
+            row["audio"].replace(
+                "\\",
+                "/"
+            )
+        )
+    )
+
+    transcript_path = (
+        PROJECT_ROOT
+        / Path(
+            row["transcript"].replace(
+                "\\",
+                "/"
+            )
+        )
+    )
 
     if not audio_path.exists():
-        print(f"[UYARI] Audio yok: {audio_path}")
+
+        print(
+            f"[UYARI] Audio yok: "
+            f"{audio_path}"
+        )
+
         return []
 
     if not transcript_path.exists():
-        print(f"[UYARI] Transcript yok: {transcript_path}")
+
+        print(
+            f"[UYARI] Transcript yok: "
+            f"{transcript_path}"
+        )
+
         return []
 
-    transcript = transcript_path.read_text(encoding="utf-8")
-    entries = parse_transcript(transcript)
+    transcript = (
+        transcript_path.read_text(
+            encoding="utf-8"
+        )
+    )
+
+    entries = parse_transcript(
+        transcript
+    )
 
     if not entries:
-        print(f"[UYARI] Transcript parse edilemedi: {transcript_path}")
+        print(
+            f"[UYARI] Transcript parse "
+            f"edilemedi: {transcript_path}"
+        )
         return []
 
-    audio, sample_rate = sf.read(audio_path)
-    total_duration = len(audio) / sample_rate
+    audio, sample_rate = load_audio(
+        audio_path
+    )
 
-    # Utterance'ları 30 sn sınırını aşmadan grupla
+    total_duration = (
+        len(audio) / sample_rate
+    )
+
+    # ========================================================
+    # 1. Speech utterance'larını çıkar
+    # ========================================================
+
+    speech_entries = [
+        entry
+        for entry in entries
+        if entry["type"] == "speech"
+    ]
+
+    # ========================================================
+    # 2. Her speech için bitiş timestamp'ini belirle
+    #
+    # Öncelik:
+    #
+    # A) Arada silence varsa -> silence timestamp
+    # B) Arada unclear varsa -> unclear timestamp
+    # C) Yoksa -> sonraki event timestamp
+    # D) Son speech -> audio sonu
+    # ========================================================
+
+    utterances = []
+
+    for i, entry in enumerate(entries):
+
+        if entry["type"] != "speech":
+            continue
+
+        start = entry["timestamp"]
+
+        end = None
+
+        # Sonraki event
+        for next_entry in entries[i + 1:]:
+
+            # Silence / unclear:
+            # mevcut konuşmanın bitişi
+            if next_entry["type"] in {
+                "silence",
+                "unclear",
+            }:
+
+                end = next_entry["timestamp"]
+                break
+
+            # Bir sonraki speech
+            if next_entry["type"] == "speech":
+
+                end = next_entry["timestamp"]
+                break
+
+        if end is None:
+            end = total_duration
+
+        end = min(
+            end,
+            total_duration
+        )
+
+        if end <= start:
+            continue
+
+        duration = end - start
+
+        utterances.append({
+            "start": start,
+            "end": end,
+            "duration": duration,
+            "text": entry["text"],
+        })
+
+    # ========================================================
+    # 3. 30 sn sınırına göre utterance grouping
+    # ========================================================
+
     groups = []
+
     current_group = []
     current_start = None
 
-    for index, (timestamp, text) in enumerate(entries):
-        if current_start is None:
-            current_start = timestamp
-            current_group = [(timestamp, text)]
+    for utterance in utterances:
+
+        start = utterance["start"]
+        end = utterance["end"]
+        duration = utterance["duration"]
+
+        # ----------------------------------------------------
+        # Tek utterance zaten >30s
+        # ----------------------------------------------------
+
+        if duration > SEGMENT_SECONDS:
+
+            # Önce mevcut grubu kapat
+            if current_group:
+
+                groups.append(
+                    current_group
+                )
+
+                current_group = []
+                current_start = None
+
+            # Şimdilik atma!
+            # Rapora ekle.
+            long_utterances_report.append({
+                "split": split,
+                "record_id": row["id"],
+                "start": start,
+                "end": end,
+                "duration": duration,
+                "text": utterance["text"],
+            })
+
+            # Ayrı segment olarak koru.
+            groups.append([
+                utterance
+            ])
+
             continue
 
-        proposed_duration = timestamp - current_start
+        # ----------------------------------------------------
+        # İlk normal utterance
+        # ----------------------------------------------------
 
-        if proposed_duration > SEGMENT_SECONDS:
-            groups.append(current_group)
-            current_start = timestamp
-            current_group = [(timestamp, text)]
+        if current_start is None:
+
+            current_start = start
+            current_group = [
+                utterance
+            ]
+
+            continue
+
+        # ----------------------------------------------------
+        # Yeni utterance eklenebilir mi?
+        # ----------------------------------------------------
+
+        proposed_duration = (
+            end - current_start
+        )
+
+        if proposed_duration <= SEGMENT_SECONDS:
+
+            current_group.append(
+                utterance
+            )
+
         else:
-            current_group.append((timestamp, text))
+
+            groups.append(
+                current_group
+            )
+
+            current_group = [
+                utterance
+            ]
+
+            current_start = start
 
     if current_group:
-        groups.append(current_group)
+        groups.append(
+            current_group
+        )
+
+    # ========================================================
+    # 4. Audio + text oluştur
+    # ========================================================
 
     segments = []
 
-    for group_index, group in enumerate(groups, start=1):
-        start_sec = group[0][0]
+    for group_index, group in enumerate(
+        groups,
+        start=1
+    ):
 
-        if group_index < len(groups):
-            end_sec = groups[group_index][0][0]
-        else:
-            end_sec = total_duration
+        start_sec = group[0]["start"]
+        end_sec = group[-1]["end"]
 
-        # Güvenlik: 30 saniyeyi aşmasın
-        if end_sec - start_sec > SEGMENT_SECONDS:
-            end_sec = start_sec + SEGMENT_SECONDS
-
-        segment_text = unicodedata.normalize(
-            "NFC", " ".join(text for _, text in group).strip()
+        duration = (
+            end_sec - start_sec
         )
+
+        # Güvenlik
+        if (
+            duration > SEGMENT_SECONDS
+            and len(group) > 1
+        ):
+
+            print(
+                f"[UYARI] Beklenmeyen >30s grup: "
+                f"{row['id']} "
+                f"{start_sec:.2f}-"
+                f"{end_sec:.2f}"
+            )
+
+            continue
+
+        segment_text = " ".join(
+            item["text"]
+            for item in group
+        ).strip()
 
         if not segment_text:
             continue
 
-        record_name = f"{row['id']}_part_{group_index:03d}"
-        output_dir = AUDIO_DIR / split
-        output_audio = output_dir / f"{record_name}.wav"
+        record_name = (
+            f"{row['id']}"
+            f"_part_{group_index:03d}"
+        )
 
-        success = write_segment_audio(
+        output_dir = (
+            AUDIO_DIR / split
+        )
+
+        output_audio = (
+            output_dir
+            / f"{record_name}.wav"
+        )
+
+        success = write_audio_segment(
             audio=audio,
             sample_rate=sample_rate,
             start_sec=start_sec,
@@ -240,27 +581,54 @@ def process_record(row, split):
             "id": record_name,
             "original_id": row["id"],
             "split": split,
-            "audio": output_audio.relative_to(PROJECT_ROOT).as_posix(),
-            "text": segment_text,
+            "audio": output_audio
+                .relative_to(
+                    PROJECT_ROOT
+                )
+                .as_posix(),
+            "text": unicodedata.normalize(
+                "NFC",
+                segment_text
+            ),
             "start": start_sec,
             "end": end_sec,
-            "duration": round(end_sec - start_sec, 3),
+            "duration": round(
+                duration,
+                3
+            ),
         })
 
     return segments
 
 
+# ============================================================
+# MAIN
+# ============================================================
+
 def main():
+
     print("=" * 80)
     print("WHISPER SEGMENT DATASET")
     print("=" * 80)
 
-    # Eski segmentleri tamamen temizle
-    if OUTPUT_DIR.exists():
-        print("\nEski segmentler temizleniyor...")
-        shutil.rmtree(OUTPUT_DIR)
+    # --------------------------------------------------------
+    # Eski segmentleri temizle
+    # --------------------------------------------------------
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    if OUTPUT_DIR.exists():
+
+        print(
+            "\nEski segmentler temizleniyor..."
+        )
+
+        shutil.rmtree(
+            OUTPUT_DIR
+        )
+
+    OUTPUT_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
     all_segments = {
         "train": [],
@@ -268,20 +636,53 @@ def main():
         "test": [],
     }
 
+    long_utterances_report = []
+
+    # --------------------------------------------------------
+    # Process
+    # --------------------------------------------------------
+
     for input_file in INPUT_FILES:
+
         if not input_file.exists():
-            print(f"[UYARI] Manifest bulunamadı: {input_file}")
+
+            print(
+                f"[UYARI] Manifest bulunamadı: "
+                f"{input_file}"
+            )
+
             continue
 
         split = input_file.stem
-        rows = load_csv(input_file)
+
+        rows = load_csv(
+            input_file
+        )
 
         print()
-        print(f"{split.upper()} orijinal kayıt: {len(rows)}")
+        print(
+            f"{split.upper()} "
+            f"orijinal kayıt: "
+            f"{len(rows)}"
+        )
 
         for row in rows:
-            segments = process_record(row, split)
-            all_segments[split].extend(segments)
+
+            segments = process_record(
+                row=row,
+                split=split,
+                long_utterances_report=(
+                    long_utterances_report
+                ),
+            )
+
+            all_segments[
+                split
+            ].extend(segments)
+
+    # --------------------------------------------------------
+    # Save manifests
+    # --------------------------------------------------------
 
     fieldnames = [
         "id",
@@ -294,24 +695,130 @@ def main():
         "duration",
     ]
 
-    for split, records in all_segments.items():
-        output_file = OUTPUT_DIR / f"{split}_segments.csv"
+    for split, records in (
+        all_segments.items()
+    ):
 
-        with output_file.open("w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
+        output_file = (
+            OUTPUT_DIR
+            / f"{split}_segments.csv"
+        )
+
+        with output_file.open(
+            "w",
+            encoding="utf-8-sig",
+            newline=""
+        ) as f:
+
+            writer = csv.DictWriter(
+                f,
+                fieldnames=fieldnames
+            )
+
             writer.writeheader()
             writer.writerows(records)
 
-        print(f"{split.upper()} segment sayısı: {len(records)}")
+        print(
+            f"{split.upper()} "
+            f"segment sayısı: "
+            f"{len(records)}"
+        )
 
         too_long = [
-            r for r in records if float(r["duration"]) > SEGMENT_SECONDS
+            r
+            for r in records
+            if float(r["duration"])
+            > SEGMENT_SECONDS
         ]
 
         if too_long:
+
             print(
-                f"[HATA] {split}: {len(too_long)} segment 30 saniyeden uzun!"
+                f"[UYARI] {split}: "
+                f"{len(too_long)} "
+                f"segment 30 saniyeden uzun."
             )
+
+    # --------------------------------------------------------
+    # Long utterance report
+    # --------------------------------------------------------
+
+    report_file = (
+        OUTPUT_DIR
+        / "long_utterances.csv"
+    )
+
+    report_fields = [
+        "split",
+        "record_id",
+        "start",
+        "end",
+        "duration",
+        "text",
+    ]
+
+    with report_file.open(
+        "w",
+        encoding="utf-8-sig",
+        newline=""
+    ) as f:
+
+        writer = csv.DictWriter(
+            f,
+            fieldnames=report_fields
+        )
+
+        writer.writeheader()
+        writer.writerows(
+            long_utterances_report
+        )
+
+    print()
+    print("=" * 80)
+    print("UZUN UTTERANCE RAPORU")
+    print("=" * 80)
+
+    if long_utterances_report:
+
+        print(
+            f"Toplam: "
+            f"{len(long_utterances_report)}"
+        )
+
+        for item in long_utterances_report:
+
+            print()
+            print(
+                f"[{item['split']}] "
+                f"{item['record_id']}"
+            )
+
+            print(
+                f"  zaman: "
+                f"{item['start']:.2f} - "
+                f"{item['end']:.2f}"
+            )
+
+            print(
+                f"  süre: "
+                f"{item['duration']:.2f} s"
+            )
+
+            print(
+                f"  text: "
+                f"{item['text']}"
+            )
+
+    else:
+
+        print(
+            "30 saniyeden uzun utterance yok."
+        )
+
+    print()
+    print(
+        f"Rapor: {report_file}"
+    )
 
     print()
     print("=" * 80)

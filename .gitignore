@@ -13,3 +13,6 @@ training/models/
 # IDE / Sistem Dosyaları
 .vscode/
 .DS_Store
+*.ziptemp data/
+
+.env
