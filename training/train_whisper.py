@@ -1,3 +1,4 @@
+import argparse
 import csv
 from pathlib import Path
 import unicodedata
@@ -11,18 +12,7 @@ from transformers import (
     WhisperProcessor,
 )
 
-# ----------------------------------------------------------------------
-# Yol ve Model Yapılandırması
-# ----------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-SEGMENT_DIR = PROJECT_ROOT / "training" / "segments"
-
-TRAIN_FILE = SEGMENT_DIR / "train_segments.csv"
-VALIDATION_FILE = SEGMENT_DIR / "validation_segments.csv"
-OUTPUT_DIR = (
-    PROJECT_ROOT / "training" / "models" / "whisper-small-finetuned"
-)
-
 MODEL_NAME = "openai/whisper-small"
 MAX_LABEL_LENGTH = 448
 
@@ -83,7 +73,7 @@ def prepare_example(example: dict) -> dict:
     audio = example["audio"]
     audio_array = audio["array"]
 
-    # Stereo sesleri mono kanala indirgeme
+    # Stereo sesleri mono kanala indirgeme (güvenlik fallback'i)
     if getattr(audio_array, "ndim", 1) == 2:
         if audio_array.shape[0] < audio_array.shape[1]:
             audio_array = audio_array.mean(axis=0)
@@ -144,15 +134,36 @@ class DataCollatorSpeechSeq2Seq:
 # Main Training Loop
 # ----------------------------------------------------------------------
 def main():
+    parser = argparse.ArgumentParser(description="Whisper Fine-Tuning Eğitimi")
+    parser.add_argument(
+        "--mode",
+        choices=["mono", "dual"],
+        default="mono",
+        help="Eğitim veri kümesi: 'mono' (v3) veya 'dual' (v4 kanal ayrık). Varsayılan: mono",
+    )
+    args = parser.parse_args()
+
+    # Dizinleri moda göre belirle (v3 ve v4 birbirini ezmez)
+    if args.mode == "dual":
+        segment_dir = PROJECT_ROOT / "training" / "segments_dual_mono"
+        output_dir = PROJECT_ROOT / "training" / "models" / "whisper-small-finetuned-v4"
+    else:
+        segment_dir = PROJECT_ROOT / "training" / "segments"
+        output_dir = PROJECT_ROOT / "training" / "models" / "whisper-small-finetuned"
+
+    train_file = segment_dir / "train_segments.csv"
+    val_file = segment_dir / "validation_segments.csv"
+
     print("=" * 80)
-    print("WHISPER FINE-TUNING")
+    print(f"WHISPER FINE-TUNING [MOD: {args.mode.upper()}]")
     print("=" * 80)
     print(f"Base Model : {MODEL_NAME}")
-    print(f"Çıktı Yolu : {OUTPUT_DIR}\n")
+    print(f"Veri Yolu  : {segment_dir}")
+    print(f"Çıktı Yolu : {output_dir}\n")
 
     # 1. Veri Yükleme ve Doğrulama
-    train_records = load_and_validate_manifest(TRAIN_FILE)
-    val_records = load_and_validate_manifest(VALIDATION_FILE)
+    train_records = load_and_validate_manifest(train_file)
+    val_records = load_and_validate_manifest(val_file)
 
     print(f"Geçerli Train Segment Sayısı      : {len(train_records)}")
     print(f"Geçerli Validation Segment Sayısı : {len(val_records)}")
@@ -184,9 +195,9 @@ def main():
     model.generation_config.forced_decoder_ids = None
     model.config.forced_decoder_ids = None
 
-    # 4. Eğitim Bağımsız Değişkenleri
+    # 4. Eğitim Hiperparametreleri
     training_args = Seq2SeqTrainingArguments(
-        output_dir=str(OUTPUT_DIR),
+        output_dir=str(output_dir),
         per_device_train_batch_size=4,
         per_device_eval_batch_size=4,
         gradient_accumulation_steps=1,
@@ -224,12 +235,12 @@ def main():
 
     # 6. Kaydetme
     print("\nModel ve Processor kaydediliyor...")
-    trainer.save_model(str(OUTPUT_DIR))
-    processor.save_pretrained(str(OUTPUT_DIR))
+    trainer.save_model(str(output_dir))
+    processor.save_pretrained(str(output_dir))
 
     print("\n" + "=" * 80)
     print("EĞİTİM BAŞARIYLA TAMAMLANDI")
-    print(f"Model Kayıt Yeri: {OUTPUT_DIR}")
+    print(f"Model Kayıt Yeri: {output_dir}")
     print("=" * 80)
 
 
