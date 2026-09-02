@@ -1,5 +1,6 @@
 import argparse
 import csv
+import json
 from pathlib import Path
 import re
 import unicodedata
@@ -14,6 +15,37 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TEST_MANIFEST = PROJECT_ROOT / "training" / "manifests" / "test.csv"
 V3_MODEL_PATH = PROJECT_ROOT / "training" / "models" / "whisper-small-finetuned"
 V4_MODEL_PATH = PROJECT_ROOT / "training" / "models" / "whisper-small-finetuned-v4"
+
+
+def fix_eos_token_on_disk(model_dir: Path | str) -> None:
+    """Diskteki generation_config.json dosyasında eos_token_id listeyse int yapar."""
+    cfg_path = Path(model_dir) / "generation_config.json"
+    if not cfg_path.exists():
+        return
+
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if isinstance(data.get("eos_token_id"), (list, tuple)):
+            data["eos_token_id"] = int(data["eos_token_id"][0])
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            print(f"[ONARILDI] Diskteki config düzeltildi: {cfg_path.name}")
+    except Exception as exc:
+        print(f"[UYARI] Config onarımı atlandı: {exc}")
+
+
+def sanitize_pipeline(pipe):
+    """Belleğe yüklenen modelin generation_config ve config nesnelerindeki eos_token_id'yi int yapar."""
+    if pipe is not None and hasattr(pipe, "model"):
+        model = pipe.model
+        for target in [getattr(model, "generation_config", None), getattr(model, "config", None)]:
+            if target is not None and hasattr(target, "eos_token_id"):
+                eos = getattr(target, "eos_token_id")
+                if isinstance(eos, (list, tuple)):
+                    target.eos_token_id = int(eos[0])
+    return pipe
 
 
 def normalize_turkish_asr(text: str) -> str:
@@ -38,7 +70,7 @@ def extract_full_reference_text(transcript_path: Path) -> str:
     """Orijinal txt transkriptindeki metadata satırlarını ve etiketleri temizler."""
     raw_text = transcript_path.read_text(encoding="utf-8")
     raw_text = unicodedata.normalize("NFC", raw_text)
-    
+
     clean_lines = []
     for line in raw_text.splitlines():
         line = line.strip()
@@ -112,10 +144,10 @@ def run_v4_dual_inference(pipe, audio_path: Path) -> str:
         if text and ch["timestamp"][0] is not None:
             timeline_chunks.append({"start": ch["timestamp"][0], "text": text})
 
-    # Kronolojik olarak sıraya diz ve birleştir
+    # Kronolojik sıraya diz ve birleştir
     timeline_chunks.sort(key=lambda x: x["start"])
     merged_text = " ".join([c["text"] for c in timeline_chunks])
-    
+
     return merged_text.strip()
 
 
@@ -141,12 +173,16 @@ def main():
     print(f"Test Manifesti : {TEST_MANIFEST}")
     print(f"Cihaz          : {'CUDA' if device == 0 else 'CPU'}\n")
 
+    # 1. Olası eos_token_id listesi hatalarını diskte önceden temizle
+    fix_eos_token_on_disk(args.v3_path)
+    fix_eos_token_on_disk(args.v4_path)
+
     with TEST_MANIFEST.open("r", encoding="utf-8-sig") as f:
         test_calls = list(csv.DictReader(f))
 
     print(f"Toplam Test Çağrısı: {len(test_calls)}\n")
 
-    # Pipeline yüklemeleri
+    # 2. Modelleri yükle ve bellek içi token tiplerini sağlama al
     print("Pipeline modelleri yükleniyor...")
     pipe_v3 = pipeline(
         "automatic-speech-recognition",
@@ -154,12 +190,15 @@ def main():
         device=device,
         generate_kwargs={"language": "turkish", "task": "transcribe"},
     )
+    pipe_v3 = sanitize_pipeline(pipe_v3)
+
     pipe_v4 = pipeline(
         "automatic-speech-recognition",
         model=args.v4_path,
         device=device,
         generate_kwargs={"language": "turkish", "task": "transcribe"},
     )
+    pipe_v4 = sanitize_pipeline(pipe_v4)
 
     all_refs = []
     all_v3_preds = []
