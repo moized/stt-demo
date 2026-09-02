@@ -1,3 +1,4 @@
+import argparse
 import csv
 from pathlib import Path
 import re
@@ -9,10 +10,6 @@ import torch
 from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-TEST_CSV_PATH = PROJECT_ROOT / "training" / "segments" / "test_segments.csv"
-FINETUNED_MODEL_PATH = (
-    PROJECT_ROOT / "training" / "models" / "whisper-small-finetuned"
-)
 BASE_MODEL_NAME = "openai/whisper-small"
 
 
@@ -22,7 +19,6 @@ def normalize_turkish_asr(text: str) -> str:
         return ""
 
     text = unicodedata.normalize("NFC", text.strip())
-    # Türkçe İ / I harf dönüşümleri (lowercase öncesi yapılmalı)
     text = text.replace("İ", "i").replace("I", "ı")
     text = text.lower()
     text = unicodedata.normalize("NFC", text)
@@ -68,13 +64,33 @@ def transcribe_audio(model, processor, audio_path: str, device: str) -> str:
 
 
 def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print("=" * 80)
-    print("WHISPER BENCHMARK & EVALUATION")
-    print("=" * 80)
-    print(f"Çalıştırılan Cihaz: {device}\n")
+    parser = argparse.ArgumentParser(description="Whisper Test Seti Değerlendirme")
+    parser.add_argument(
+        "--mode",
+        choices=["mono", "dual"],
+        default="mono",
+        help="Değerlendirme modu: 'mono' (v3) veya 'dual' (v4 kanal ayrık). Varsayılan: mono",
+    )
+    args = parser.parse_args()
 
-    test_records = load_manifest(TEST_CSV_PATH)
+    # Yolları moda göre dinamik eşle
+    if args.mode == "dual":
+        test_csv_path = PROJECT_ROOT / "training" / "segments_dual_mono" / "test_segments.csv"
+        finetuned_model_path = PROJECT_ROOT / "training" / "models" / "whisper-small-finetuned-v4"
+    else:
+        test_csv_path = PROJECT_ROOT / "training" / "segments" / "test_segments.csv"
+        finetuned_model_path = PROJECT_ROOT / "training" / "models" / "whisper-small-finetuned"
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    print("=" * 80)
+    print(f"WHISPER BENCHMARK & EVALUATION [MOD: {args.mode.upper()}]")
+    print("=" * 80)
+    print(f"Çalıştırılan Cihaz : {device}")
+    print(f"Test Manifest Yolu : {test_csv_path}")
+    print(f"Değerlendirilen FT : {finetuned_model_path}\n")
+
+    test_records = load_manifest(test_csv_path)
     print(f"Toplam Test Segment Sayısı: {len(test_records)}\n")
 
     # Modelleri Yükleme
@@ -88,9 +104,9 @@ def main():
     base_model.eval()
 
     print("[2/2] Fine-Tuned Whisper yükleniyor...")
-    ft_processor = WhisperProcessor.from_pretrained(str(FINETUNED_MODEL_PATH))
+    ft_processor = WhisperProcessor.from_pretrained(str(finetuned_model_path))
     ft_model = WhisperForConditionalGeneration.from_pretrained(
-        str(FINETUNED_MODEL_PATH)
+        str(finetuned_model_path)
     ).to(device)
     ft_model.eval()
 
