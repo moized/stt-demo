@@ -7,6 +7,7 @@ import unicodedata
 
 import jiwer
 import librosa
+import numpy as np
 import soundfile as sf
 import torch
 from transformers import pipeline
@@ -22,25 +23,21 @@ def fix_eos_token_on_disk(model_dir: Path | str) -> None:
     cfg_path = Path(model_dir) / "generation_config.json"
     if not cfg_path.exists():
         return
-
     try:
         with open(cfg_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-
         if isinstance(data.get("eos_token_id"), (list, tuple)):
             data["eos_token_id"] = int(data["eos_token_id"][0])
             with open(cfg_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
-            print(f"[ONARILDI] Diskteki config düzeltildi: {cfg_path.name}")
-    except Exception as exc:
-        print(f"[UYARI] Config onarımı atlandı: {exc}")
+    except Exception:
+        pass
 
 
 def sanitize_pipeline(pipe):
-    """Belleğe yüklenen modelin generation_config ve config nesnelerindeki eos_token_id'yi int yapar."""
+    """Bellekteki generation_config nesnesindeki token uyumsuzluklarını giderir."""
     if pipe is not None and hasattr(pipe, "model"):
-        model = pipe.model
-        for target in [getattr(model, "generation_config", None), getattr(model, "config", None)]:
+        for target in [getattr(pipe.model, "generation_config", None), getattr(pipe.model, "config", None)]:
             if target is not None and hasattr(target, "eos_token_id"):
                 eos = getattr(target, "eos_token_id")
                 if isinstance(eos, (list, tuple)):
@@ -49,15 +46,29 @@ def sanitize_pipeline(pipe):
 
 
 def normalize_turkish_asr(text: str) -> str:
-    """ASR değerlendirmesi için Türkçe Unicode ve noktalama standardizasyonu."""
-    if not isinstance(text, str) or not text:
+    """benchmark.py standartlarına uygun tam Türkçe ASR normalizasyonu."""
+    if not isinstance(text, str) or not text.strip():
         return ""
 
     text = unicodedata.normalize("NFC", text.strip())
-    text = text.replace("İ", "i").replace("I", "ı")
-    text = text.lower()
+    text = text.replace("İ", "i").replace("I", "ı").lower()
     text = unicodedata.normalize("NFC", text)
 
+    # 1. benchmark.py kuralı: Zaman damgalarını süz ([00:12], [01:10:05])
+    text = re.sub(r"\[?\d{2}:\d{2}(?::\d{2})?\]?", " ", text)
+
+    # 2. benchmark.py kuralı: Konuşmacı etiketlerini süz
+    text = re.sub(
+        r"(konuşmacı\s+\d+|agent|customer)\s*:\s*",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Özel gürültü / sessizlik etiketlerini temizle
+    text = re.sub(r"\[(sessizlik|anlaşılmıyor|müzik)\]", " ", text, flags=re.IGNORECASE)
+
+    # Noktalama işaretlerini kaldır
     text = "".join(
         char
         for char in text
@@ -67,39 +78,41 @@ def normalize_turkish_asr(text: str) -> str:
 
 
 def extract_full_reference_text(transcript_path: Path) -> str:
-    """Orijinal txt transkriptindeki metadata satırlarını ve etiketleri temizler."""
+    """Orijinal txt transkriptindeki metadata satırlarını ayıklar."""
     raw_text = transcript_path.read_text(encoding="utf-8")
     raw_text = unicodedata.normalize("NFC", raw_text)
 
     clean_lines = []
     for line in raw_text.splitlines():
         line = line.strip()
-        if not line:
+        if not line or line.startswith("#") or line.startswith("Model:") or line.startswith("Prompt-SHA256:") or line == "--- TRANSKRIPT ---":
             continue
-        if (
-            line.startswith("#")
-            or line.startswith("Model:")
-            or line.startswith("Prompt-SHA256:")
-            or line == "--- TRANSKRIPT ---"
-        ):
-            continue
+        clean_lines.append(line)
 
-        # Zaman damgası ve konuşmacı etiketini temizle: "[00:15] Konuşmacı 1: Alo" -> "Alo"
-        line = re.sub(r"^\[\d{2}:\d{2}(?::\d{2})?\]\s*", "", line)
-        line = re.sub(r"^Konuşmacı\s+\d+\s*:\s*", "", line, flags=re.IGNORECASE)
+    return normalize_turkish_asr(" ".join(clean_lines))
 
-        if line.lower() in {"[sessizlik]", "[anlaşılmıyor]"}:
-            continue
 
-        line = re.sub(r"\[anlaşılmıyor\]", "", line, flags=re.IGNORECASE).strip()
-        if line:
-            clean_lines.append(line)
-
-    return " ".join(clean_lines)
+def get_speech_intervals(audio_16k: np.ndarray, top_db: int = 25, min_length_s: float = 0.4):
+    """Sesteki sessizlikleri atıp sadece konuşma olan aralıkları [başlangıç, bitiş] döner."""
+    intervals = librosa.effects.split(audio_16k, top_db=top_db, frame_length=2048, hop_length=512)
+    valid_chunks = []
+    
+    for start_idx, end_idx in intervals:
+        dur = (end_idx - start_idx) / 16000.0
+        if dur >= min_length_s:
+            # Kelimenin başı/sonu kesilmesin diye 0.15s pay (padding) ekle
+            pad = int(0.15 * 16000)
+            s_padded = max(0, start_idx - pad)
+            e_padded = min(len(audio_16k), end_idx + pad)
+            valid_chunks.append({
+                "start_s": start_idx / 16000.0,
+                "audio": audio_16k[s_padded:e_padded]
+            })
+    return valid_chunks
 
 
 def run_v3_mono_inference(pipe, audio_path: Path) -> str:
-    """v3 için mono ses üzerinde kayan pencereli tam çağrı transkripsiyonu."""
+    """v3 için mono ses üzerinde halüsinasyonsuz transkripsiyon."""
     audio_array, sr = librosa.load(str(audio_path), sr=16000, mono=True)
     result = pipe(
         audio_array,
@@ -111,10 +124,9 @@ def run_v3_mono_inference(pipe, audio_path: Path) -> str:
 
 
 def run_v4_dual_inference(pipe, audio_path: Path) -> str:
-    """v4 için stereo kanalları ayrı deşifre edip zaman damgalı birleştirme."""
+    """v4 için stereo kanalları akustik VAD ile süzüp kronolojik birleştirme."""
     audio_data, sr = sf.read(str(audio_path))
 
-    # Stereo değilse mono fallback uygula
     if getattr(audio_data, "ndim", 1) < 2:
         left_channel = audio_data
         right_channel = audio_data
@@ -122,47 +134,41 @@ def run_v4_dual_inference(pipe, audio_path: Path) -> str:
         left_channel = audio_data[:, 0]
         right_channel = audio_data[:, 1]
 
-    # 16kHz resample
     left_16k = librosa.resample(left_channel.astype(float), orig_sr=sr, target_sr=16000)
     right_16k = librosa.resample(right_channel.astype(float), orig_sr=sr, target_sr=16000)
 
-    # İki kanalı bağımsız transkribe et (zaman damgalarıyla)
-    left_res = pipe(left_16k, chunk_length_s=30, stride_length_s=4, return_timestamps=True)
-    right_res = pipe(right_16k, chunk_length_s=30, stride_length_s=4, return_timestamps=True)
+    # İki kanalın konuşma aralıklarını ayrı ayrı bul (sessizlikler doğrudan elenir)
+    left_segments = get_speech_intervals(left_16k, top_db=25)
+    right_segments = get_speech_intervals(right_16k, top_db=25)
 
-    timeline_chunks = []
+    timeline = []
 
-    # Sol kanal parçaları (Ajan)
-    for ch in left_res.get("chunks", []):
-        text = ch["text"].strip()
-        if text and ch["timestamp"][0] is not None:
-            timeline_chunks.append({"start": ch["timestamp"][0], "text": text})
+    # Sol kanal (Ajan)
+    for seg in left_segments:
+        res = pipe(seg["audio"], return_timestamps=False)
+        text = res["text"].strip()
+        if text:
+            timeline.append({"start": seg["start_s"], "text": text})
 
-    # Sağ kanal parçaları (Müşteri)
-    for ch in right_res.get("chunks", []):
-        text = ch["text"].strip()
-        if text and ch["timestamp"][0] is not None:
-            timeline_chunks.append({"start": ch["timestamp"][0], "text": text})
+    # Sağ kanal (Müşteri)
+    for seg in right_segments:
+        res = pipe(seg["audio"], return_timestamps=False)
+        text = res["text"].strip()
+        if text:
+            timeline.append({"start": seg["start_s"], "text": text})
 
-    # Kronolojik sıraya diz ve birleştir
-    timeline_chunks.sort(key=lambda x: x["start"])
-    merged_text = " ".join([c["text"] for c in timeline_chunks])
+    if not timeline:
+        return ""
 
-    return merged_text.strip()
+    # Konuşmaları gerçek başlama zamanına göre sıraya diz ve birleştir
+    timeline.sort(key=lambda x: x["start"])
+    return " ".join(item["text"] for item in timeline).strip()
 
 
 def main():
     parser = argparse.ArgumentParser(description="Tam Çağrı (Full Call) A/B Benchmark")
-    parser.add_argument(
-        "--v3_path",
-        default=str(V3_MODEL_PATH),
-        help="v3 Model dizini",
-    )
-    parser.add_argument(
-        "--v4_path",
-        default=str(V4_MODEL_PATH),
-        help="v4 Model dizini",
-    )
+    parser.add_argument("--v3_path", default=str(V3_MODEL_PATH), help="v3 Model dizini")
+    parser.add_argument("--v4_path", default=str(V4_MODEL_PATH), help="v4 Model dizini")
     args = parser.parse_args()
 
     device = 0 if torch.cuda.is_available() else -1
@@ -173,7 +179,6 @@ def main():
     print(f"Test Manifesti : {TEST_MANIFEST}")
     print(f"Cihaz          : {'CUDA' if device == 0 else 'CPU'}\n")
 
-    # 1. Olası eos_token_id listesi hatalarını diskte önceden temizle
     fix_eos_token_on_disk(args.v3_path)
     fix_eos_token_on_disk(args.v4_path)
 
@@ -182,13 +187,19 @@ def main():
 
     print(f"Toplam Test Çağrısı: {len(test_calls)}\n")
 
-    # 2. Modelleri yükle ve bellek içi token tiplerini sağlama al
+    # generate_kwargs içine condition_on_previous_text=False ekleyerek döngü halüsinasyonlarını engelliyoruz
+    gen_kwargs = {
+        "language": "turkish",
+        "task": "transcribe",
+        "condition_on_previous_text": False,
+    }
+
     print("Pipeline modelleri yükleniyor...")
     pipe_v3 = pipeline(
         "automatic-speech-recognition",
         model=args.v3_path,
         device=device,
-        generate_kwargs={"language": "turkish", "task": "transcribe"},
+        generate_kwargs=gen_kwargs,
     )
     pipe_v3 = sanitize_pipeline(pipe_v3)
 
@@ -196,7 +207,7 @@ def main():
         "automatic-speech-recognition",
         model=args.v4_path,
         device=device,
-        generate_kwargs={"language": "turkish", "task": "transcribe"},
+        generate_kwargs=gen_kwargs,
     )
     pipe_v4 = sanitize_pipeline(pipe_v4)
 
@@ -213,8 +224,7 @@ def main():
         audio_path = PROJECT_ROOT / Path(call["audio"].replace("\\", "/"))
         transcript_path = PROJECT_ROOT / Path(call["transcript"].replace("\\", "/"))
 
-        ref_raw = extract_full_reference_text(transcript_path)
-        ref_norm = normalize_turkish_asr(ref_raw)
+        ref_norm = extract_full_reference_text(transcript_path)
 
         # İnfirans
         v3_raw = run_v3_mono_inference(pipe_v3, audio_path)
