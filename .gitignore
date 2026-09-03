@@ -1,4 +1,4 @@
-# Python / Sanal Ortam
+# Python / Sanal ortam
 .venv/
 __pycache__/
 *.pyc
@@ -13,6 +13,18 @@ training/models/
 # IDE / Sistem Dosyaları
 .vscode/
 .DS_Store
-*.ziptemp data/
 
+# ZIP dosyaları
+*.zip
+
+# Geçici dosyalar
+temp data/
+
+# Environment
 .env
+
+# Notebook
+*.ipynb
+
+# CSV
+*.csv

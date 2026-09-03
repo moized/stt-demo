@@ -1,6 +1,8 @@
 import argparse
 import csv
+import json
 from pathlib import Path
+import random
 import unicodedata
 
 from datasets import Audio, Dataset
@@ -51,6 +53,26 @@ def load_and_validate_manifest(path: Path) -> list[dict]:
         print(f"[UYARI] {path.name}: {missing_audio_count} ses dosyası bulunamadı!")
 
     return validated
+
+
+def sample_nested_subset(records: list[dict], ratio: float, seed: int = 42) -> list[dict]:
+    """
+    İç içe (nested) alt kümeleme:
+    Sabit seed ile permütasyon yapılarak %25'lik verinin %50'nin,
+    %50'lik verinin de %100'ün kesin alt kümesi kalması garanti edilir.
+    """
+    if ratio >= 1.0:
+        return records
+
+    n_total = len(records)
+    n_sample = max(1, int(round(n_total * ratio)))
+
+    rng = random.Random(seed)
+    shuffled_indices = list(range(n_total))
+    rng.shuffle(shuffled_indices)
+
+    selected_indices = sorted(shuffled_indices[:n_sample])
+    return [records[i] for i in selected_indices]
 
 
 def create_hf_dataset(records: list[dict]) -> Dataset:
@@ -130,6 +152,23 @@ class DataCollatorSpeechSeq2Seq:
         return batch
 
 
+def sanitize_generation_config_file(output_dir: Path) -> None:
+    """Kaydedilen generation_config.json içindeki eos_token_id listesini int yapar."""
+    cfg_file = output_dir / "generation_config.json"
+    if not cfg_file.exists():
+        return
+    try:
+        with open(cfg_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data.get("eos_token_id"), (list, tuple)):
+            data["eos_token_id"] = int(data["eos_token_id"][0])
+            with open(cfg_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            print(f"[ONARILDI] {cfg_file.name} içindeki eos_token_id int olarak sabitlendi.")
+    except Exception as exc:
+        print(f"[UYARI] generation_config.json güncellenemedi: {exc}")
+
+
 # ----------------------------------------------------------------------
 # Main Training Loop
 # ----------------------------------------------------------------------
@@ -141,32 +180,47 @@ def main():
         default="mono",
         help="Eğitim veri kümesi: 'mono' (v3) veya 'dual' (v4 kanal ayrık). Varsayılan: mono",
     )
+    parser.add_argument(
+        "--data_ratio",
+        type=float,
+        default=1.0,
+        help="Eğitim verisi oranı: 0.25, 0.50 veya 1.0. Varsayılan: 1.0",
+    )
     args = parser.parse_args()
 
-    # Dizinleri moda göre belirle (v3 ve v4 birbirini ezmez)
+    # Dizinleri moda ve veri oranına göre dinamik belirle
+    ratio_tag = f"-p{int(args.data_ratio * 100)}" if args.data_ratio < 1.0 else ""
+
     if args.mode == "dual":
         segment_dir = PROJECT_ROOT / "training" / "segments_dual_mono"
-        output_dir = PROJECT_ROOT / "training" / "models" / "whisper-small-finetuned-v4"
+        folder_name = f"whisper-small-dual{ratio_tag}" if ratio_tag else "whisper-small-finetuned-v4"
     else:
         segment_dir = PROJECT_ROOT / "training" / "segments"
-        output_dir = PROJECT_ROOT / "training" / "models" / "whisper-small-finetuned"
+        folder_name = f"whisper-small-mono{ratio_tag}" if ratio_tag else "whisper-small-finetuned"
+
+    output_dir = PROJECT_ROOT / "training" / "models" / folder_name
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     train_file = segment_dir / "train_segments.csv"
     val_file = segment_dir / "validation_segments.csv"
 
     print("=" * 80)
-    print(f"WHISPER FINE-TUNING [MOD: {args.mode.upper()}]")
+    print(f"WHISPER FINE-TUNING [MOD: {args.mode.upper()} | ORAN: %{int(args.data_ratio * 100)}]")
     print("=" * 80)
     print(f"Base Model : {MODEL_NAME}")
     print(f"Veri Yolu  : {segment_dir}")
     print(f"Çıktı Yolu : {output_dir}\n")
 
     # 1. Veri Yükleme ve Doğrulama
-    train_records = load_and_validate_manifest(train_file)
+    all_train_records = load_and_validate_manifest(train_file)
     val_records = load_and_validate_manifest(val_file)
 
-    print(f"Geçerli Train Segment Sayısı      : {len(train_records)}")
-    print(f"Geçerli Validation Segment Sayısı : {len(val_records)}")
+    # İç içe alt kümeleme uygula (Validation ASLA filtrelenmez)
+    train_records = sample_nested_subset(all_train_records, args.data_ratio, seed=42)
+
+    print(f"Toplam Havuzdaki Train Segmenti : {len(all_train_records)}")
+    print(f"Kullanılan Train Segment Sayısı  : {len(train_records)} (%{int(args.data_ratio * 100)})")
+    print(f"Sabit Validation Segment Sayısı  : {len(val_records)} (%100 Kilitli)")
 
     if not train_records or not val_records:
         raise ValueError("Eğitim için yeterli segment verisi bulunamadı!")
@@ -194,6 +248,10 @@ def main():
     model.generation_config.task = "transcribe"
     model.generation_config.forced_decoder_ids = None
     model.config.forced_decoder_ids = None
+
+    # eos_token_id tip uyumsuzluğu koruması
+    if isinstance(model.generation_config.eos_token_id, (list, tuple)):
+        model.generation_config.eos_token_id = int(model.generation_config.eos_token_id[0])
 
     # 4. Eğitim Hiperparametreleri
     training_args = Seq2SeqTrainingArguments(
@@ -233,10 +291,11 @@ def main():
     print("=" * 80)
     trainer.train()
 
-    # 6. Kaydetme
+    # 6. Kaydetme ve Konfigürasyon Onarımı
     print("\nModel ve Processor kaydediliyor...")
     trainer.save_model(str(output_dir))
     processor.save_pretrained(str(output_dir))
+    sanitize_generation_config_file(output_dir)
 
     print("\n" + "=" * 80)
     print("EĞİTİM BAŞARIYLA TAMAMLANDI")
