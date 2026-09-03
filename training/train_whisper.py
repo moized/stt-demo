@@ -3,6 +3,7 @@ import csv
 import json
 from pathlib import Path
 import random
+import shutil
 import unicodedata
 
 from datasets import Audio, Dataset
@@ -199,6 +200,16 @@ def main():
         folder_name = f"whisper-small-mono{ratio_tag}" if ratio_tag else "whisper-small-finetuned"
 
     output_dir = PROJECT_ROOT / "training" / "models" / folder_name
+
+    # ==================================================================
+    # KORUMA 1: Model zaten eğitilmiş ve safetensors varsa doğrudan atla
+    # ==================================================================
+    if (output_dir / "model.safetensors").exists():
+        print("=" * 80)
+        print(f"[ATLANDI] {folder_name} modeli zaten eğitilmiş ve diskte hazır!")
+        print("=" * 80)
+        return
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
     train_file = segment_dir / "train_segments.csv"
@@ -296,6 +307,13 @@ def main():
     trainer.save_model(str(output_dir))
     processor.save_pretrained(str(output_dir))
     sanitize_generation_config_file(output_dir)
+
+    # ==================================================================
+    # KORUMA 2: Diski korumak için 4-5 GB tutan ara checkpoint'leri sil
+    # ==================================================================
+    print("Disk temizliği: Ara checkpoint klasörleri siliniyor...")
+    for ckpt in output_dir.glob("checkpoint-*"):
+        shutil.rmtree(ckpt, ignore_errors=True)
 
     print("\n" + "=" * 80)
     print("EĞİTİM BAŞARIYLA TAMAMLANDI")
